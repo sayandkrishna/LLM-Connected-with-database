@@ -5,3 +5,5 @@ venv/
 *.pyc
 
 /.vscode
+.env
+*.env
