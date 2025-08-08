@@ -1,0 +1,11 @@
+Connection Name (Alias): Cars DB 
+
+Host: switchback.proxy.rlwy.net
+
+Database Name: railway
+
+User: postgres
+
+Password: IQsXDsfKTWVIRvGuMjBVERUmcFGHzUWn
+
+Port: 46965
