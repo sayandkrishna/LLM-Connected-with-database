@@ -423,7 +423,7 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
     query_str = request.user_query.lower().strip()
     content_hash = hashlib.sha256(query_str.encode('utf-8')).hexdigest()
     cache_key = f"query_cache:{user_id}:{content_hash}"
-
+    print(f"🔑 Cache client: {cache_client}")
     # 2. Check the Redis cache first.
     if cache_client:
         cached_data = cache_client.get(cache_key)
