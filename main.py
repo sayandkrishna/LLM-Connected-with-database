@@ -8,7 +8,7 @@ import time
 from typing import List, Dict, Optional
 import hashlib
 import os
-import requests
+import redis
 from test import llmcall
 import jwt
 import datetime
@@ -16,13 +16,27 @@ import pytz
 
 # --- New Imports and Setup for .env file ---
 from dotenv import load_dotenv
-
 # Load environment variables from a .env file.
 # This should be at the very top of your application.
 load_dotenv()
 
 # Create the FastAPI app instance
 app = FastAPI()
+
+# --- New Redis Cache Configuration ---
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
+CACHE_EXPIRATION_SECONDS = int(os.getenv("CACHE_EXPIRATION_SECONDS", 3600))  # 1 hour default
+
+# Setup Redis connection
+try:
+    cache_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    cache_client.ping()  # Check the connection
+    print("✅ Successfully connected to Redis.")
+except redis.exceptions.ConnectionError as e:
+    print(f"⚠️ Could not connect to Redis: {e}. Caching will be disabled.")
+    cache_client = None  # Disable caching if connection fails
 
 # Default Database configuration (used for authentication and schema caching)
 # Now loaded from environment variables
@@ -260,8 +274,12 @@ class DbConfigRequest(BaseModel):
     db_password: str
     db_port: int
 
+# In main.py
+from typing import List, Dict, Optional, Any
+
 class QueryRequest(BaseModel):
     user_query: str
+    conversation_history: Optional[List[Dict[str, Any]]] = None # Add this line
 
 # --- Startup Event ---
 @app.on_event("startup")
@@ -398,13 +416,26 @@ async def list_user_databases(user_id: str = Depends(get_current_user_id)):
 @app.post("/ask", tags=["LLM Interaction"])
 async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user_id)):
     """
-    Handles a user's natural language query by:
-    1. Securely fetching only the user's own database schemas.
-    2. Calling the LLM to generate a SQL query.
-    3. Securely retrieving the user's credentials for the target database.
-    4. Executing the query and returning the result.
+    Handles a user's query with conversational context and an optimized caching layer.
+    The cache key is now based *only* on the user's query, not the conversation history.
     """
-    # 1. Securely get schemas for ONLY the current user's databases.
+    # 1. Create a cache key based ONLY on the user's query for better caching.
+    query_str = request.user_query.lower().strip()
+    content_hash = hashlib.sha256(query_str.encode('utf-8')).hexdigest()
+    cache_key = f"query_cache:{user_id}:{content_hash}"
+
+    # 2. Check the Redis cache first.
+    if cache_client:
+        cached_data = cache_client.get(cache_key)
+        if cached_data:
+            print(f"✅ Returning cached response for key: {cache_key}")
+            cached_response = json.loads(cached_data)
+            cached_response["source"] = "cache"
+            return cached_response
+
+    print(f"🔍 No cache hit for key: {cache_key}. Processing new request.")
+    
+    # 3. If no cache hit, securely get schemas for the user's databases.
     all_user_schemas = get_all_user_db_schemas(user_id)
     if not all_user_schemas:
         raise HTTPException(
@@ -412,9 +443,14 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
             detail="No database connections found. Please add a database configuration first."
         )
 
-    # 2. Call the LLM with the user-specific schema context.
+    # 4. Call the LLM with the user query, schemas, AND conversation history.
+    #    The history is used here for context, but not for the cache key.
     try:
-        llm_response_str = llmcall(request.user_query, all_user_schemas)
+        llm_response_str = llmcall(
+            request.user_query,
+            all_user_schemas,
+            request.conversation_history
+        )
         llm_output = json.loads(llm_response_str)
 
         inferred_db_name = llm_output.get("db")
@@ -438,8 +474,7 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
             detail=f"An unexpected error occurred during LLM processing: {e}"
         )
 
-    # 3. Securely retrieve credentials for the specific user and inferred database.
-    # This is the critical security step to prevent cross-user data access.
+    # 5. Securely retrieve credentials for the specific user and inferred database.
     creds_conn = None
     try:
         creds_conn = get_db_connection(DEFAULT_DB_CONFIG)
@@ -456,14 +491,14 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
             detail=f"Database configuration '{inferred_db_name}' not found or you do not have access."
         )
 
-    # 4. Validate that the inferred table exists in the user's schema for that DB.
+    # 6. Validate that the inferred table exists in the user's schema for that DB.
     if inferred_table not in all_user_schemas.get(inferred_db_name, {}):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"LLM inferred table '{inferred_table}' which was not found in the '{inferred_db_name}' database schema."
         )
 
-    # 5. Execute the query using the securely retrieved credentials.
+    # 7. Execute the query using the securely retrieved credentials.
     conn = None
     df = pd.DataFrame()
     try:
@@ -473,7 +508,7 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
         print(f"Database execution error: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Database query failed. Please check the generated query syntax or your data. Error: {e.pgerror}"
+            detail=f"Database query failed. Please check the generated query syntax or your data."
         )
     except Exception as e:
         print(f"Unexpected error during SQL execution: {e}")
@@ -485,11 +520,23 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
         if conn:
             conn.close()
 
-    # 6. Return the successful response.
-    return {
+    # 8. Build the final response.
+    final_response = {
         "inferred_db_name": inferred_db_name,
         "inferred_table": inferred_table,
         "sql_query": sql_query,
         "rows_returned": len(df),
-        "data": df.to_dict(orient="records")
+        "data": df.to_dict(orient="records"),
+        "source": "live"
     }
+
+    # 9. Store the response in Redis if the client is available.
+    if cache_client:
+        # Use the query-only cache_key defined at the beginning.
+        cache_client.setex(
+            cache_key,
+            CACHE_EXPIRATION_SECONDS,
+            json.dumps(final_response)
+        )
+
+    return final_response

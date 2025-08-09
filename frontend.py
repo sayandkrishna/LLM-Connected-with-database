@@ -75,18 +75,25 @@ def save_db_config(token, config):
         st.error("Connection Error: Could not save configuration.")
         return False
 
-def ask_llm(token, query):
+# In frontend.py
+
+def ask_llm(token, query, history: list = None): # Add history parameter
     headers = {"token": token}
+    # Create the payload including the history
+    payload = {
+        "user_query": query,
+        "conversation_history": history or []
+    }
     try:
-        response = requests.post(f"{API_URL}/ask", headers=headers, json={"user_query": query})
+        # Send the payload
+        response = requests.post(f"{API_URL}/ask", headers=headers, json=payload)
         if response.status_code == 200:
             return response.json()
         st.error(f"Error from AI: {response.json().get('detail')}")
         return None
     except requests.ConnectionError:
-        st.error("Connection Error: Could not get response from AI.")
+        st.error("Connection Error: Could not connect to the backend.")
         return None
-
 # --- UI Rendering Functions ---
 
 def display_login_page():
@@ -119,11 +126,14 @@ def display_login_page():
                     if submitted:
                         signup_user(username, password)
 
+# In frontend.py
+
 def display_sidebar():
     """Renders the sidebar with DB list and add new DB form."""
     with st.sidebar:
         st.title("🗂️ Databases")
-        st.markdown(f"User: **{st.session_state.user_id}**")
+        # CORRECTED LINE: Display the username, not the user_id
+        st.markdown(f"User: **{st.session_state.username}**") 
         
         # Fetch and display databases
         if not st.session_state.databases:
@@ -140,6 +150,8 @@ def display_sidebar():
         with st.expander("🔗 Connect New Database"):
             with st.form("new_db_form", clear_on_submit=True):
                 db_name = st.text_input("Connection Name (Alias)")
+                # You can add the db_type selector here if you've implemented multi-db support
+                # db_type = st.selectbox("Database Type", ["postgres", "mysql"])
                 db_host = st.text_input("Host", value="localhost")
                 db_database = st.text_input("Database Name")
                 db_user = st.text_input("User")
@@ -151,35 +163,49 @@ def display_sidebar():
                     config = {
                         "db_name": db_name, "db_host": db_host, "db_database": db_database,
                         "db_user": db_user, "db_password": db_password, "db_port": db_port
+                        # "db_type": db_type 
                     }
                     if save_db_config(st.session_state.access_token, config):
-                        # Reset databases in state to force a refresh on next run
                         st.session_state.databases = []
                         st.rerun()
 
         st.button("Logout", on_click=logout, use_container_width=True)
-
 def display_chat_interface():
-    """Renders the main chat area."""
+    """Renders the main chat area, handles message display, and user input."""
     st.title("Chat with your Data 💬")
 
     # Display chat messages from history on app rerun
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            # Check for complex content (dict) vs simple string
+            # Check for complex content (dict) vs. simple string
             if isinstance(message["content"], dict):
-                if "summary" in message["content"]:
-                    st.markdown(message["content"]["summary"])
-                if "sql" in message["content"]:
-                    st.code(message["content"]["sql"], language="sql")
-                if "dataframe" in message["content"]:
-                    df = pd.DataFrame(message["content"]["dataframe"])
+                response_data = message["content"]
+                
+                # Display a summary message
+                summary = f"I found **{response_data.get('rows_returned', 0)}** results from the " \
+                          f"`{response_data.get('inferred_table', 'N/A')}` table in the " \
+                          f"`{response_data.get('inferred_db_name', 'N/A')}` database."
+                
+                # Add a cache indicator if the response is from the cache
+                if response_data.get("source") == "cache":
+                    summary += " ⚡️ *From Cache*"
+                
+                st.markdown(summary)
+
+                # Display the SQL query in an expander
+                with st.expander("Show Generated SQL Query"):
+                    st.code(response_data.get('sql_query', 'No SQL query available.'), language="sql")
+
+                # Display the data as a dataframe
+                if response_data.get('data'):
+                    df = pd.DataFrame(response_data['data'])
                     st.dataframe(df)
             else:
+                # For simple string messages (like user prompts or errors)
                 st.markdown(message["content"])
 
     # Accept user input
-    if prompt := st.chat_input("Ask a question about your data... e.g., 'show all products from the electronics category'"):
+    if prompt := st.chat_input("Ask a question about your data..."):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         # Display user message in chat message container
@@ -189,24 +215,22 @@ def display_chat_interface():
         # Get assistant response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = ask_llm(st.session_state.access_token, prompt)
+                # Get the last 4 messages for conversational context
+                history = st.session_state.messages[-5:-1]
+                
+                # Pass the history in the API call
+                response = ask_llm(st.session_state.access_token, prompt, history)
+                
                 if response:
-                    # Create a rich response object for the chat history
-                    assistant_response_content = {
-                        "summary": f"I found **{response['rows_returned']}** results from the "
-                                   f"`{response['inferred_table']}` table in the "
-                                   f"`{response['inferred_db_name']}` database.",
-                        "sql": response['sql_query'],
-                        "dataframe": response['data']
-                    }
-                    st.session_state.messages.append({"role": "assistant", "content": assistant_response_content})
+                    # Append the full, rich dictionary response
+                    st.session_state.messages.append({"role": "assistant", "content": response})
                 else:
+                    # Handle cases where the API call failed
                     error_message = "I couldn't process that request. Please try rephrasing or check the backend logs."
                     st.session_state.messages.append({"role": "assistant", "content": error_message})
             
-            # Rerun to display the new message
+            # Rerun to display the new assistant message immediately
             st.rerun()
-
 def logout():
     """Clears the session state to log the user out."""
     st.session_state.logged_in = False
