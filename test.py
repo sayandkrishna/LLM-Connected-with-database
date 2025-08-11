@@ -11,10 +11,10 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY not found in .env file.")
+    raise EnvironmentError("OPENROUTER_API_KEY not found in .env file. Please add it.")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL = "openai/gpt-oss-20b:free" # Use the specified free model
+LLM_MODEL = "openai/gpt-oss-20b:free"  # Free model
 
 def call_llm(
     system_prompt: str,
@@ -24,10 +24,7 @@ def call_llm(
     retries: int = 3,
     timeout: int = 60,
 ) -> Dict[str, Any]:
-    """
-    A generic function to call the OpenRouter API with specified prompts and parameters.
-    Handles API requests, retries, and error handling.
-    """
+    """Call the OpenRouter API with prompts and parameters."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -55,35 +52,31 @@ def call_llm(
         except requests.exceptions.RequestException as e:
             print(f"HTTP error on attempt {i + 1}: {e}")
             if i < retries - 1:
-                time.sleep(2**i)  # Exponential backoff
+                time.sleep(2**i)
             else:
                 raise ConnectionError(f"Failed to connect to OpenRouter after {retries} retries.") from e
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            raise  # Re-raise the exception after logging
+            print(f"Unexpected error: {e}")
+            raise
 
 
 def llmcall(user_query: str, all_db_schemas: Dict, conversation_history: Optional[List[Dict]] = None) -> str:
-    """
-    Converts a natural language query into a SQL query using an LLM.
-    It builds a detailed prompt including database schemas and conversation history.
-    """
-    # 1. Build a detailed schema string for the prompt
+    """Convert a natural language query into SQL or admin command, with memory for last db/table."""
+
+    # Step 1: Build schema string
     db_schema_prompt_lines = []
     for db_name, tables in all_db_schemas.items():
         db_schema_prompt_lines.append(f"Database '{db_name}':")
         for table_name, schema_info in tables.items():
             db_schema_prompt_lines.append(f"  Table '{table_name}':")
-            columns = [
-                f"    - {col.get('column_name')} ({col.get('data_type')})"
-                for col in schema_info
-                if col.get("column_name") and col.get("data_type")
-            ]
-            db_schema_prompt_lines.extend(columns)
+            for col in schema_info:
+                if col.get("column_name") and col.get("data_type"):
+                    db_schema_prompt_lines.append(f"    - {col['column_name']} ({col['data_type']})")
         db_schema_prompt_lines.append("")
     full_db_schema_string = "\n".join(db_schema_prompt_lines)
 
-    # 2. Format conversation history for context
+    # Step 2: Track last used db/table from history
+    last_db = last_table = None
     history_string = "No previous conversation."
     if conversation_history:
         history_lines = ["Here is the recent conversation history for context:"]
@@ -92,15 +85,27 @@ def llmcall(user_query: str, all_db_schemas: Dict, conversation_history: Optiona
             content = turn.get("content", "")
             if role == "user":
                 history_lines.append(f"- User: {content}")
-            elif role == "assistant" and isinstance(content, dict) and "sql_query" in content:
-                history_lines.append(f"- Assistant (executed SQL): {content['sql_query']}")
+            elif role == "assistant" and isinstance(content, dict):
+                if "db" in content:
+                    last_db = content.get("db")
+                if "table" in content:
+                    last_table = content.get("table")
+                history_lines.append(f"- Assistant Output: {json.dumps(content)}")
         history_string = "\n".join(history_lines)
 
-    # 3. Define the system and user prompts
+    # Step 3: If user omits db/table, tell LLM to reuse last ones
+    memory_instructions = ""
+    if last_db or last_table:
+        memory_instructions = (
+            f"If the user request does not mention a database or table, reuse the last used ones: "
+            f"db='{last_db}' table='{last_table}'.\n"
+            f"If there is no last table (None), only reuse the db."
+        )
+
+    # Step 4: Prompts
     system_prompt = (
-        "You are a world-class SQL expert. Your task is to convert natural language "
-        "queries into SQL, considering the provided database schema and conversation history. "
-        "Your output must be a single, valid JSON object."
+        "You are a world-class database expert. Convert natural language requests into either SQL queries or admin commands. "
+        "Your output must be a single valid JSON object only."
     )
 
     user_prompt = f"""
@@ -110,53 +115,45 @@ def llmcall(user_query: str, all_db_schemas: Dict, conversation_history: Optiona
 **Conversation History:**
 {history_string}
 ---
+**Memory Instructions:**
+{memory_instructions}
+---
 **Core Instructions:**
-1.  Analyze the user's request and the conversation history.
-2.  Correct any spelling errors in table or column names based on the schema.
-3.  When filtering by a person's name, use the `ILIKE` operator for case-insensitive matching. If the name has a potential misspelling, you can use `ILIKE` with wildcard characters (`%`) to match similar names.
-4.  Generate a single, syntactically correct SQL query.
-5.  Your final output must be a single JSON object with three keys: "db" (the database name), "table" (the primary table), and "query" (the SQL query).
-6.  If the request is impossible to fulfill, return an empty JSON object: {{}}.
-
-**Examples:**
-- User: "show me all mobiles"
-  Output: {{\"db\": \"mobiles\", \"table\": \"mobile_phones\", \"query\": \"SELECT * FROM mobile_phones\"}}
-- History: "SELECT * FROM teacher WHERE salary > 20000"
-  User: "what is the total salary of these teachers"
-  Output: {{\"db\": \"teachers\", \"table\": \"teacher\", \"query\": \"SELECT SUM(salary) FROM teacher WHERE salary > 20000\"}}
-- User: "list details of a student named john"
-  Output: {{\"db\": \"teachers\", \"table\": \"students\", \"query\": \"SELECT * FROM students WHERE name ILIKE '%john%'\"}}
-
+1. For Data Queries: Return {{"db": "...", "table": "...", "query": "..."}}.
+2. For List Tables: Return {{"db": "...", "action": "list_tables"}}.
+3. If unclear, return {{}}.
 
 **Current User Request:** {user_query}
-
 **JSON Output:**
 """
 
-    # 4. Call the generic LLM function
     try:
         raw_response = call_llm(system_prompt, user_prompt, temperature=0.0)
-        text_output = raw_response["choices"][0]["message"]["content"]
+        text_output = raw_response["choices"][0]["message"]["content"].strip()
 
-        # 5. Extract and validate the JSON output
+        # Extract JSON
         json_match = re.search(r'\{.*\}', text_output, re.DOTALL)
         if not json_match:
-            raise ValueError(f"LLM did not return a valid JSON object. Raw output: {text_output}")
+            raise ValueError(f"LLM did not return valid JSON. Raw output: {text_output}")
 
-        json_string = json_match.group(0)
-        parsed_output = json.loads(json_string)
+        parsed_output = json.loads(json_match.group(0))
 
-        # Basic validation for required keys
-        if parsed_output and any(k not in parsed_output for k in ["db", "table", "query"]):
-            raise ValueError(f"LLM output is missing required keys ('db', 'table', 'query'). Output: {json_string}")
+        # Validate keys
+        if parsed_output:
+            if parsed_output.get("action") == "list_tables":
+                if "db" not in parsed_output:
+                    raise ValueError("Missing 'db' key for list_tables action.")
+            else:
+                for k in ["db", "table", "query"]:
+                    if k not in parsed_output:
+                        raise ValueError(f"Missing key '{k}' in output: {parsed_output}")
 
-        print(f"Successfully generated LLM Output: {json_string}")
-        return json_string
+        print(f"LLM Output: {parsed_output}")
+        return json.dumps(parsed_output)
 
     except (ConnectionError, ValueError, json.JSONDecodeError) as e:
-        print(f"Error in LLM processing pipeline: {e}")
-        # In case of a critical error, return an empty JSON string to be handled by the main app
+        print(f"Error: {e}")
         return "{}"
     except Exception as e:
-        print(f"An unexpected error occurred in llmcall: {e}")
+        print(f"Unexpected error in llmcall: {e}")
         return "{}"

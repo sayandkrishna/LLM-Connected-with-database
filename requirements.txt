@@ -7,3 +7,4 @@ PyJWT
 pytz
 requests
 streamlit
+redis

@@ -13,7 +13,7 @@ from test import llmcall
 import jwt
 import datetime
 import pytz
-
+import re
 # --- New Imports and Setup for .env file ---
 from dotenv import load_dotenv
 # Load environment variables from a .env file.
@@ -413,29 +413,71 @@ async def list_user_databases(user_id: str = Depends(get_current_user_id)):
             cur.close()
             conn.close()
 
+@app.get("/list-tables/{db_name}", tags=["Database Management"])
+async def list_db_tables(db_name: str, user_id: str = Depends(get_current_user_id)):
+    creds_conn = None
+    try:
+        creds_conn = get_db_connection(DEFAULT_DB_CONFIG)
+        creds_cur = creds_conn.cursor()
+        db_config = get_user_db_credentials(creds_cur, user_id, db_name)
+        
+        if not db_config:
+            raise HTTPException(status_code=404, detail=f"Database configuration '{db_name}' not found or you do not have access.")
+            
+        table_names = get_all_table_names(db_config)
+        return {"tables": table_names}
+    except Exception as e:
+        print(f"Error listing tables for db {db_name}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        if creds_conn:
+            creds_cur.close()
+            creds_conn.close()
+def is_list_tables_request(user_query: str) -> bool:
+    """
+    Detects if the user is asking for a list of tables.
+    """
+    query = user_query.lower().strip()
+    # A set of trigger phrases to detect the user's intent
+    triggers = [
+        "list all tables",
+        "show all tables",
+        "list the tables",
+        "show me the tables",
+        "what tables are in",
+        "which tables are available"
+    ]
+    return any(trigger in query for trigger in triggers)
+
 @app.post("/ask", tags=["LLM Interaction"])
 async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user_id)):
     """
-    Handles a user's query with conversational context and an optimized caching layer.
-    The cache key is now based *only* on the user's query, not the conversation history.
+    Handles a user's query by routing all requests through the LLM for maximum
+    flexibility and error correction, with an optimized caching layer.
     """
-    # 1. Create a cache key based ONLY on the user's query for better caching.
-    query_str = request.user_query.lower().strip()
-    content_hash = hashlib.sha256(query_str.encode('utf-8')).hexdigest()
+    # NOTE: The "is_list_tables_request" shortcut has been removed.
+    # All queries will now go through the LLM.
+
+    # 1. Create a cache key based on the user's query.
+    user_query = request.user_query.lower().strip()
+    content_hash = hashlib.sha256(user_query.encode('utf-8')).hexdigest()
     cache_key = f"query_cache:{user_id}:{content_hash}"
-    print(f"🔑 Cache client: {cache_client}")
+    
     # 2. Check the Redis cache first.
     if cache_client:
         cached_data = cache_client.get(cache_key)
         if cached_data:
             print(f"✅ Returning cached response for key: {cache_key}")
             cached_response = json.loads(cached_data)
+            # Ensure cached responses for list_tables are handled
+            if cached_response.get("action") == "list_tables":
+                return cached_response
             cached_response["source"] = "cache"
             return cached_response
 
-    print(f"🔍 No cache hit for key: {cache_key}. Processing new request.")
+    print(f"🔍 No cache hit for key: {cache_key}. Processing new request via LLM.")
     
-    # 3. If no cache hit, securely get schemas for the user's databases.
+    # 3. Securely get schemas for the user's databases.
     all_user_schemas = get_all_user_db_schemas(user_id)
     if not all_user_schemas:
         raise HTTPException(
@@ -443,8 +485,7 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
             detail="No database connections found. Please add a database configuration first."
         )
 
-    # 4. Call the LLM with the user query, schemas, AND conversation history.
-    #    The history is used here for context, but not for the cache key.
+    # 4. Call the LLM with the user query, schemas, and conversation history.
     try:
         llm_response_str = llmcall(
             request.user_query,
@@ -452,91 +493,91 @@ async def ask_llm(request: QueryRequest, user_id: str = Depends(get_current_user
             request.conversation_history
         )
         llm_output = json.loads(llm_response_str)
+    except Exception as e:
+        print(f"Error calling LLM or parsing its response: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred during LLM processing: {e}"
+        )
 
+    # 5. NEW: Intelligently process the LLM's response.
+    # Case A: The LLM wants to list tables.
+    if llm_output.get("action") == "list_tables":
+        db_name = llm_output.get("db")
+        if not db_name:
+            raise HTTPException(status_code=400, detail="LLM chose to list tables but did not specify a database.")
+        
+        print(f"LLM decided to list tables for database: '{db_name}'")
+        creds_conn = None
+        try:
+            creds_conn = get_db_connection(DEFAULT_DB_CONFIG)
+            creds_cur = creds_conn.cursor()
+            db_config = get_user_db_credentials(creds_cur, user_id, db_name)
+            
+            if not db_config:
+                raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found or you lack access.")
+            
+            table_names = get_all_table_names(db_config)
+            final_response = {
+                "inferred_db_name": db_name,
+                "action": "list_tables",
+                "data": table_names,
+                "source": "live_action"
+            }
+            # Cache this action's result
+            if cache_client:
+                cache_client.setex(cache_key, CACHE_EXPIRATION_SECONDS, json.dumps(final_response))
+            return final_response
+        finally:
+            if creds_conn:
+                creds_conn.close()
+
+    # Case B: The LLM generated a SQL query.
+    elif "query" in llm_output:
         inferred_db_name = llm_output.get("db")
         inferred_table = llm_output.get("table")
-        sql_query = llm_output.get("query")
+        sql_query = ll_output.get("query")
 
         if not all([inferred_db_name, inferred_table, sql_query]):
-            raise ValueError("LLM response is missing 'db', 'table', or 'query' key.")
+            raise HTTPException(status_code=400, detail="LLM response for query is missing 'db', 'table', or 'query' key.")
 
         print(f"LLM inferred DB: {inferred_db_name}, Table: {inferred_table}, Generated SQL: {sql_query}")
 
-    except (json.JSONDecodeError, ValueError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"LLM returned an invalid response. Error: {e}. Raw response: '{llm_response_str}'"
-        )
-    except Exception as e:
-        print(f"Error calling LLM: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred during LLM processing: {e}"
-        )
+        # Securely retrieve credentials for the specific user and inferred database.
+        creds_conn = None
+        try:
+            creds_conn = get_db_connection(DEFAULT_DB_CONFIG)
+            current_db_config = get_user_db_credentials(creds_conn.cursor(), user_id, inferred_db_name)
+        finally:
+            if creds_conn:
+                creds_conn.close()
 
-    # 5. Securely retrieve credentials for the specific user and inferred database.
-    creds_conn = None
-    try:
-        creds_conn = get_db_connection(DEFAULT_DB_CONFIG)
-        creds_cur = creds_conn.cursor()
-        current_db_config = get_user_db_credentials(creds_cur, user_id, inferred_db_name)
-    finally:
-        if creds_conn:
-            creds_cur.close()
-            creds_conn.close()
+        if not current_db_config:
+            raise HTTPException(status_code=404, detail=f"Database configuration '{inferred_db_name}' not found or you do not have access.")
 
-    if not current_db_config:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Database configuration '{inferred_db_name}' not found or you do not have access."
-        )
-
-    # 6. Validate that the inferred table exists in the user's schema for that DB.
-    if inferred_table not in all_user_schemas.get(inferred_db_name, {}):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"LLM inferred table '{inferred_table}' which was not found in the '{inferred_db_name}' database schema."
-        )
-
-    # 7. Execute the query using the securely retrieved credentials.
-    conn = None
-    df = pd.DataFrame()
-    try:
-        conn = get_db_connection(current_db_config)
-        df = pd.read_sql(sql_query, conn)
-    except psycopg2.Error as e:
-        print(f"Database execution error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Database query failed. Please check the generated query syntax or your data."
-        )
-    except Exception as e:
-        print(f"Unexpected error during SQL execution: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred during query execution: {e}"
-        )
-    finally:
-        if conn:
-            conn.close()
-
-    # 8. Build the final response.
-    final_response = {
-        "inferred_db_name": inferred_db_name,
-        "inferred_table": inferred_table,
-        "sql_query": sql_query,
-        "rows_returned": len(df),
-        "data": df.to_dict(orient="records"),
-        "source": "live"
-    }
-
-    # 9. Store the response in Redis if the client is available.
-    if cache_client:
-        # Use the query-only cache_key defined at the beginning.
-        cache_client.setex(
-            cache_key,
-            CACHE_EXPIRATION_SECONDS,
-            json.dumps(final_response)
-        )
-
-    return final_response
+        # Execute the query.
+        conn = None
+        try:
+            conn = get_db_connection(current_db_config)
+            df = pd.read_sql(sql_query, conn)
+            final_response = {
+                "inferred_db_name": inferred_db_name,
+                "inferred_table": inferred_table,
+                "sql_query": sql_query,
+                "rows_returned": len(df),
+                "data": df.to_dict(orient="records"),
+                "source": "live"
+            }
+            # Cache the query result
+            if cache_client:
+                cache_client.setex(cache_key, CACHE_EXPIRATION_SECONDS, json.dumps(final_response))
+            return final_response
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"An error occurred during query execution: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
+    # Case C: The LLM response is unclear.
+    else:
+        raise HTTPException(status_code=400, detail=f"LLM returned an unrecognized response format: {llm_output}")
