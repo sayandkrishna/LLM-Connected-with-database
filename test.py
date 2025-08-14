@@ -123,21 +123,26 @@ def build_conversation_context(conversation_history: Optional[List[Dict]] = None
         elif role == "assistant":
             if isinstance(content, dict):
                 # Extract database and table info
-                if "db" in content:
-                    last_db = content["db"]
-                if "table" in content:
-                    last_table = content["table"]
+                # Check for both new (inferred) and old key names for compatibility
+                db_key = "inferred_db_name" if "inferred_db_name" in content else "db"
+                table_key = "inferred_table" if "inferred_table" in content else "table"
+
+                if db_key in content:
+                    last_db = content[db_key]
+                if table_key in content:
+                    last_table = content[table_key]
                 
                 # Summarize assistant response
                 if content.get("action") == "list_tables":
-                    context_lines.append(f"Assistant: Listed tables in database '{content.get('db', 'unknown')}'")
+                    db_name = content.get(db_key, 'unknown')
+                    context_lines.append(f"Assistant: Listed tables in database '{db_name}'")
                 elif "sql_query" in content:
-                    context_lines.append(f"Assistant: Executed query on {content.get('table', 'unknown')} table")
+                    table_name = content.get(table_key, 'unknown')
+                    context_lines.append(f"Assistant: Executed query on {table_name} table")
                 else:
                     context_lines.append(f"Assistant: {json.dumps(content)[:100]}...")
             else:
                 context_lines.append(f"Assistant: {str(content)[:100]}...")
-    
     context_str = "\n".join(context_lines)
     return context_str, last_db, last_table
 
@@ -165,7 +170,8 @@ GUIDELINES:
 - Prefer exact table name matches
 - Use context from previous queries when database/table not specified
 - Keep SQL simple and safe (SELECT only, no DROP/DELETE)
-- Match user's intent even if they use approximate table names"""
+- Match user's intent even if they use approximate table names
+- For string comparisons in WHERE clauses, use ILIKE for case-insensitive matching (e.g., `WHERE name ILIKE 'iphone%'`)."""
 
     # Build memory instructions
     memory_hint = ""
