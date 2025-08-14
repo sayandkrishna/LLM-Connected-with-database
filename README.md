@@ -272,11 +272,6 @@ INTENT_CONFIDENCE_THRESHOLD=0.7
 
 ## Performance Characteristics
 
-### Response Times
-- **Cache Hits**: 10-50ms (semantic similarity matches)
-- **Intent Detection**: 100-500ms (pattern-based queries)
-- **LLM Fallback**: 2-10 seconds (complex queries)
-
 ### Scalability Considerations
 - **Concurrent Users**: Limited by database connection pool
 - **Cache Performance**: Redis handles thousands of concurrent requests
