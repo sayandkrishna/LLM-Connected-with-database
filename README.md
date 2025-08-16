@@ -1,4 +1,4 @@
-Here is an improved README file for your project.
+
 
 # Smart Database Query API 🤖
 
